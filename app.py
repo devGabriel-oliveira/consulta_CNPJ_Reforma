@@ -88,9 +88,6 @@ STATUS_CNPJ_INVALIDO = "CNPJ inválido"
 
 TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
-# Portal Consulta Optantes — retorna IBS/CBS sem login
-CONSULTA_OPTANTES_URL = "https://consopt.www8.receita.fazenda.gov.br/consultaoptantes/Home/ConsultarCnpj"
-
 
 # ==================== HELPERS ====================
 def limpar_cnpj(texto: str) -> str:
@@ -355,18 +352,49 @@ def normalizar_receitaws(data: dict) -> dict:
 
 
 # ==================== CONSULTA IBS / CBS (Portal Simples) ====================
+_OPTANTES_FORM_URL = "https://consopt.www8.receita.fazenda.gov.br/consultaoptantes"
+_OPTANTES_POST_URL = _OPTANTES_FORM_URL          # POST vai pra mesma URL raiz
+_RE_TOKEN = re.compile(
+    r'name="__RequestVerificationToken"\s+.*?value="([^"]+)"', re.DOTALL
+)
+# O HTML real usa <span class="spanValorVerde">valor</span>
+_RE_IBS = re.compile(
+    r"Situa[çc][aã]o\s+no\s+Regime\s+Regular\s+do\s+IBS[:\s]*<span[^>]*>\s*(.+?)\s*</span>",
+    re.IGNORECASE,
+)
+_RE_CBS = re.compile(
+    r"Situa[çc][aã]o\s+no\s+Regime\s+Regular\s+da\s+CBS[:\s]*<span[^>]*>\s*(.+?)\s*</span>",
+    re.IGNORECASE,
+)
+
+
 async def consultar_ibs_cbs(client: httpx.AsyncClient, cnpj: str) -> dict:
     """
     Consulta o Portal do Simples Nacional (Consulta Optantes) para extrair
     a situação no Regime Regular do IBS e da CBS.
+    Fluxo: GET formulário → extrai __RequestVerificationToken → POST com CNPJ
+    → segue redirect → parseia HTML do resultado.
     Retorna dict com chaves 'ibs' e 'cbs' (texto) ou '---' se falhar.
-    URL: GET consopt.www8.receita.fazenda.gov.br/consultaoptantes/Home/ConsultarCnpj?vc={cnpj}
     """
     resultado = {"ibs": "---", "cbs": "---"}
     try:
-        resp = await client.get(
-            CONSULTA_OPTANTES_URL,
-            params={"vc": cnpj},
+        # 1) GET no formulário para obter o token anti-CSRF
+        resp_form = await client.get(_OPTANTES_FORM_URL, timeout=15.0)
+        if resp_form.status_code != 200:
+            return resultado
+
+        m_token = _RE_TOKEN.search(resp_form.text)
+        if not m_token:
+            return resultado
+        token = m_token.group(1)
+
+        # 2) POST com CNPJ + token (segue redirect automaticamente)
+        resp = await client.post(
+            _OPTANTES_POST_URL,
+            data={
+                "Cnpj": cnpj,
+                "__RequestVerificationToken": token,
+            },
             timeout=15.0,
         )
         if resp.status_code != 200:
@@ -374,19 +402,12 @@ async def consultar_ibs_cbs(client: httpx.AsyncClient, cnpj: str) -> dict:
 
         html = resp.text
 
-        # Extrair "Situação no Regime Regular do IBS: <b>XXXXX</b>"
-        m_ibs = re.search(
-            r"Situa[çc][aã]o\s+no\s+Regime\s+Regular\s+do\s+IBS[:\s]*<b[^>]*>\s*(.+?)\s*</b>",
-            html, re.IGNORECASE,
-        )
+        # 3) Extrair valores de IBS e CBS do HTML
+        m_ibs = _RE_IBS.search(html)
         if m_ibs:
             resultado["ibs"] = m_ibs.group(1).strip()
 
-        # Extrair "Situação no Regime Regular da CBS: <b>XXXXX</b>"
-        m_cbs = re.search(
-            r"Situa[çc][aã]o\s+no\s+Regime\s+Regular\s+da\s+CBS[:\s]*<b[^>]*>\s*(.+?)\s*</b>",
-            html, re.IGNORECASE,
-        )
+        m_cbs = _RE_CBS.search(html)
         if m_cbs:
             resultado["cbs"] = m_cbs.group(1).strip()
 
