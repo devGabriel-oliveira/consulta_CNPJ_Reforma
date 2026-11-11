@@ -14,7 +14,9 @@ retorno real da API, e por isso sempre devolve False (bug).
 
 import asyncio
 import io
+import os
 import re
+import subprocess
 import time
 from datetime import datetime, date
 from typing import Any
@@ -22,6 +24,18 @@ from typing import Any
 import httpx
 import pandas as pd
 import streamlit as st
+
+# ── Instalar browser Playwright automaticamente (1x no deploy) ──
+_PW_INSTALL_FLAG = "/tmp/.pw_installed"
+if not os.path.exists(_PW_INSTALL_FLAG):
+    try:
+        subprocess.run(
+            ["playwright", "install", "chromium"],
+            check=True, capture_output=True, timeout=120,
+        )
+        open(_PW_INSTALL_FLAG, "w").close()
+    except Exception:
+        pass  # Se falhar, consulta IBS/CBS retornará "---"
 
 # ==================== CONFIGURAÇÃO DA PÁGINA ====================
 st.set_page_config(
@@ -353,10 +367,7 @@ def normalizar_receitaws(data: dict) -> dict:
 
 # ==================== CONSULTA IBS / CBS (Portal Simples) ====================
 _OPTANTES_FORM_URL = "https://consopt.www8.receita.fazenda.gov.br/consultaoptantes"
-_OPTANTES_POST_URL = _OPTANTES_FORM_URL          # POST vai pra mesma URL raiz
-_RE_TOKEN = re.compile(
-    r'name="__RequestVerificationToken"\s+.*?value="([^"]+)"', re.DOTALL
-)
+
 # O HTML real usa <span class="spanValorVerde">valor</span>
 _RE_IBS = re.compile(
     r"Situa[çc][aã]o\s+no\s+Regime\s+Regular\s+do\s+IBS[:\s]*<span[^>]*>\s*(.+?)\s*</span>",
@@ -367,42 +378,56 @@ _RE_CBS = re.compile(
     re.IGNORECASE,
 )
 
+# ── Playwright (browser headless) — necessário porque o portal usa hCaptcha ──
+_pw_browser = None          # singleton reutilizado entre consultas
+
+
+async def _get_playwright_browser():
+    """Retorna (e reutiliza) uma instância de browser headless."""
+    global _pw_browser
+    if _pw_browser and _pw_browser.is_connected():
+        return _pw_browser
+    try:
+        from playwright.async_api import async_playwright
+        pw = await async_playwright().start()
+        _pw_browser = await pw.chromium.launch(headless=True)
+        return _pw_browser
+    except Exception:
+        return None
+
 
 async def consultar_ibs_cbs(client: httpx.AsyncClient, cnpj: str) -> dict:
     """
-    Consulta o Portal do Simples Nacional (Consulta Optantes) para extrair
-    a situação no Regime Regular do IBS e da CBS.
-    Fluxo: GET formulário → extrai __RequestVerificationToken → POST com CNPJ
-    → segue redirect → parseia HTML do resultado.
+    Consulta o Portal do Simples Nacional (Consulta Optantes) usando
+    Playwright (browser headless) para contornar o hCaptcha invisível.
+    Fluxo: abre formulário → preenche CNPJ → clica Consultar → parseia HTML.
     Retorna dict com chaves 'ibs' e 'cbs' (texto) ou '---' se falhar.
     """
     resultado = {"ibs": "---", "cbs": "---"}
+    page = None
     try:
-        # 1) GET no formulário para obter o token anti-CSRF
-        resp_form = await client.get(_OPTANTES_FORM_URL, timeout=15.0)
-        if resp_form.status_code != 200:
+        browser = await _get_playwright_browser()
+        if not browser:
             return resultado
 
-        m_token = _RE_TOKEN.search(resp_form.text)
-        if not m_token:
-            return resultado
-        token = m_token.group(1)
+        page = await browser.new_page()
+        await page.goto(_OPTANTES_FORM_URL, timeout=25000,
+                        wait_until="networkidle")
 
-        # 2) POST com CNPJ + token (segue redirect automaticamente)
-        resp = await client.post(
-            _OPTANTES_POST_URL,
-            data={
-                "Cnpj": cnpj,
-                "__RequestVerificationToken": token,
-            },
-            timeout=15.0,
-        )
-        if resp.status_code != 200:
-            return resultado
+        # Preenche o CNPJ
+        await page.fill('input[maxlength="14"]', cnpj, timeout=5000)
 
-        html = resp.text
+        # Aguarda brevemente para o hCaptcha invisível processar
+        await page.wait_for_timeout(800)
 
-        # 3) Extrair valores de IBS e CBS do HTML
+        # Submete o formulário
+        await page.click('button[type="submit"]', timeout=5000)
+
+        # Aguarda a página de resultado carregar (span com valor)
+        await page.wait_for_selector('span.spanValorVerde', timeout=20000)
+
+        html = await page.content()
+
         m_ibs = _RE_IBS.search(html)
         if m_ibs:
             resultado["ibs"] = m_ibs.group(1).strip()
@@ -413,6 +438,12 @@ async def consultar_ibs_cbs(client: httpx.AsyncClient, cnpj: str) -> dict:
 
     except Exception:
         pass  # Se falhar, retorna "---" — não bloqueia a consulta principal
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
     return resultado
 
