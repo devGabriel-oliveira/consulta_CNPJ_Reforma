@@ -25,17 +25,25 @@ import httpx
 import pandas as pd
 import streamlit as st
 
-# ── Instalar browser Playwright automaticamente (1x no deploy) ──
-_PW_INSTALL_FLAG = "/tmp/.pw_installed"
-if not os.path.exists(_PW_INSTALL_FLAG):
-    try:
-        subprocess.run(
-            ["playwright", "install", "chromium"],
-            check=True, capture_output=True, timeout=120,
-        )
-        open(_PW_INSTALL_FLAG, "w").close()
-    except Exception:
-        pass  # Se falhar, consulta IBS/CBS retornará "---"
+# ── Playwright é opcional — instala browser automaticamente se disponível ──
+_PW_AVAILABLE = False
+try:
+    import playwright  # noqa: F401
+    _PW_INSTALL_FLAG = "/tmp/.pw_installed"
+    if not os.path.exists(_PW_INSTALL_FLAG):
+        try:
+            subprocess.run(
+                ["playwright", "install", "chromium"],
+                check=True, capture_output=True, timeout=120,
+            )
+            open(_PW_INSTALL_FLAG, "w").close()
+            _PW_AVAILABLE = True
+        except Exception:
+            pass
+    else:
+        _PW_AVAILABLE = True
+except ImportError:
+    pass  # Playwright não instalado — usa só httpx
 
 # ==================== CONFIGURAÇÃO DA PÁGINA ====================
 st.set_page_config(
@@ -368,6 +376,9 @@ def normalizar_receitaws(data: dict) -> dict:
 # ==================== CONSULTA IBS / CBS (Portal Simples) ====================
 _OPTANTES_FORM_URL = "https://consopt.www8.receita.fazenda.gov.br/consultaoptantes"
 
+_RE_TOKEN = re.compile(
+    r'name="__RequestVerificationToken"\s+.*?value="([^"]+)"', re.DOTALL
+)
 # O HTML real usa <span class="spanValorVerde">valor</span>
 _RE_IBS = re.compile(
     r"Situa[çc][aã]o\s+no\s+Regime\s+Regular\s+do\s+IBS[:\s]*<span[^>]*>\s*(.+?)\s*</span>",
@@ -378,13 +389,86 @@ _RE_CBS = re.compile(
     re.IGNORECASE,
 )
 
-# ── Playwright (browser headless) — necessário porque o portal usa hCaptcha ──
-_pw_browser = None          # singleton reutilizado entre consultas
+# Headers que simulam um navegador real — evita bloqueio por hCaptcha invisível
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+async def _consultar_ibs_cbs_httpx(cnpj: str) -> dict | None:
+    """Tenta via httpx com headers de browser. Retorna None se falhar."""
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=20.0, headers=_BROWSER_HEADERS
+        ) as session:
+            # 1) GET formulário — coleta cookies + token CSRF
+            resp_form = await session.get(_OPTANTES_FORM_URL)
+            if resp_form.status_code != 200:
+                return None
+
+            m_token = _RE_TOKEN.search(resp_form.text)
+            if not m_token:
+                return None
+            token = m_token.group(1)
+
+            # 2) POST com CNPJ + token (segue redirect)
+            resp = await session.post(
+                _OPTANTES_FORM_URL,
+                data={
+                    "Cnpj": cnpj,
+                    "__RequestVerificationToken": token,
+                },
+                headers={
+                    **_BROWSER_HEADERS,
+                    "Referer": _OPTANTES_FORM_URL,
+                    "Origin": "https://consopt.www8.receita.fazenda.gov.br",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            if resp.status_code != 200:
+                return None
+
+            html = resp.text
+
+            # 3) Verifica se o HTML contém o resultado (e não página de captcha)
+            m_ibs = _RE_IBS.search(html)
+            m_cbs = _RE_CBS.search(html)
+            if not m_ibs and not m_cbs:
+                return None  # Provavelmente captcha → fallback
+
+            resultado = {"ibs": "---", "cbs": "---"}
+            if m_ibs:
+                resultado["ibs"] = m_ibs.group(1).strip()
+            if m_cbs:
+                resultado["cbs"] = m_cbs.group(1).strip()
+            return resultado
+    except Exception:
+        return None
+
+
+# ── Playwright (fallback se httpx for bloqueado por captcha) ──
+_pw_browser = None
 
 
 async def _get_playwright_browser():
     """Retorna (e reutiliza) uma instância de browser headless."""
     global _pw_browser
+    if not _PW_AVAILABLE:
+        return None
     if _pw_browser and _pw_browser.is_connected():
         return _pw_browser
     try:
@@ -396,48 +480,35 @@ async def _get_playwright_browser():
         return None
 
 
-async def consultar_ibs_cbs(client: httpx.AsyncClient, cnpj: str) -> dict:
-    """
-    Consulta o Portal do Simples Nacional (Consulta Optantes) usando
-    Playwright (browser headless) para contornar o hCaptcha invisível.
-    Fluxo: abre formulário → preenche CNPJ → clica Consultar → parseia HTML.
-    Retorna dict com chaves 'ibs' e 'cbs' (texto) ou '---' se falhar.
-    """
-    resultado = {"ibs": "---", "cbs": "---"}
+async def _consultar_ibs_cbs_playwright(cnpj: str) -> dict | None:
+    """Fallback via Playwright headless."""
     page = None
     try:
         browser = await _get_playwright_browser()
         if not browser:
-            return resultado
+            return None
 
         page = await browser.new_page()
         await page.goto(_OPTANTES_FORM_URL, timeout=25000,
                         wait_until="networkidle")
 
-        # Preenche o CNPJ
         await page.fill('input[maxlength="14"]', cnpj, timeout=5000)
-
-        # Aguarda brevemente para o hCaptcha invisível processar
         await page.wait_for_timeout(800)
-
-        # Submete o formulário
         await page.click('button[type="submit"]', timeout=5000)
-
-        # Aguarda a página de resultado carregar (span com valor)
         await page.wait_for_selector('span.spanValorVerde', timeout=20000)
 
         html = await page.content()
+        resultado = {"ibs": "---", "cbs": "---"}
 
         m_ibs = _RE_IBS.search(html)
         if m_ibs:
             resultado["ibs"] = m_ibs.group(1).strip()
-
         m_cbs = _RE_CBS.search(html)
         if m_cbs:
             resultado["cbs"] = m_cbs.group(1).strip()
-
+        return resultado
     except Exception:
-        pass  # Se falhar, retorna "---" — não bloqueia a consulta principal
+        return None
     finally:
         if page:
             try:
@@ -445,7 +516,24 @@ async def consultar_ibs_cbs(client: httpx.AsyncClient, cnpj: str) -> dict:
             except Exception:
                 pass
 
-    return resultado
+
+async def consultar_ibs_cbs(client: httpx.AsyncClient, cnpj: str) -> dict:
+    """
+    Consulta IBS/CBS no Portal do Simples Nacional.
+    Estratégia: tenta httpx com headers de browser primeiro (rápido);
+    se o portal bloquear (captcha), usa Playwright headless como fallback.
+    """
+    # Tentativa 1: httpx com headers de browser real
+    resultado = await _consultar_ibs_cbs_httpx(cnpj)
+    if resultado:
+        return resultado
+
+    # Tentativa 2: Playwright headless (mais lento, mas contorna captcha)
+    resultado = await _consultar_ibs_cbs_playwright(cnpj)
+    if resultado:
+        return resultado
+
+    return {"ibs": "---", "cbs": "---"}
 
 
 # ==================== CONSULTA UNITÁRIA ====================
